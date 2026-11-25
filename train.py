@@ -10,6 +10,7 @@
 #
 
 import os
+import math
 import torch
 import torchvision
 from random import randint
@@ -146,6 +147,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             far_loss = l1_loss(render_far, gt_far)
             loss = loss + opt.lambda_far * far_loss
+
+        if opt.lambda_anisotropy > 0.0:
+            log_scales_sorted, _ = torch.sort(gaussians._scaling, dim=1)
+            log_s_mid, log_s_max = log_scales_sorted[:, 1], log_scales_sorted[:, 2]
+            aniso_loss = torch.clamp(log_s_max - log_s_mid.detach() - math.log(opt.max_needle_ratio), min=0.0).mean()
+            loss = loss + opt.lambda_anisotropy * aniso_loss
             
         loss.backward()
         iter_end.record()
@@ -174,8 +181,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    size_threshold = opt.size_threshold if (opt.size_threshold > 0 and iteration > opt.opacity_reset_interval) else None
+                    ws_scale_ratio = opt.max_ws_scale_ratio if iteration > opt.opacity_reset_interval else 0.0
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        split_needle_ratio=opt.split_needle_ratio,
+                        prune_needle_ratio=opt.prune_needle_ratio if iteration > opt.opacity_reset_interval else 0.0,
+                        max_ws_scale_ratio=ws_scale_ratio,
+                    )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -184,6 +200,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if iteration >= opt.densify_until_iter and iteration % 100 == 0:
+                torch.cuda.empty_cache()
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

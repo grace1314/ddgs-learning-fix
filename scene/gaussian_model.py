@@ -18,6 +18,10 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import meanDistCUDA6
+except ImportError:
+    meanDistCUDA6 = None
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from sklearn.neighbors import NearestNeighbors
@@ -149,11 +153,13 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def update_density_score(self):
-        xyz = self.get_xyz.detach().cpu().numpy()
-        knn = NearestNeighbors(n_neighbors=6).fit(xyz)
-        density = -knn.kneighbors()[0].mean(axis=1)
-        density = torch.tensor(density, device="cuda")
-        self.density_score = density
+        if meanDistCUDA6 is not None:
+            self.density_score = -meanDistCUDA6(self.get_xyz.detach())
+        else:
+            xyz = self.get_xyz.detach().cpu().numpy()
+            knn = NearestNeighbors(n_neighbors=6).fit(xyz)
+            density = -knn.kneighbors()[0].mean(axis=1)
+            self.density_score = torch.tensor(density, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -261,6 +267,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -356,7 +363,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_radii2D = torch.cat([self.max_radii2D, torch.zeros(self.get_xyz.shape[0]-self.max_radii2D.shape[0]).to(self.max_radii2D)])
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, split_needle_ratio=0.0):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -365,12 +372,39 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        needle_pts_mask = torch.zeros((n_init_points), dtype=torch.bool, device="cuda")
+        if split_needle_ratio > 0.0 and n_init_points < 350000:
+            scales_sorted, _ = torch.sort(self.get_scaling, dim=1)
+            needle_ratio = scales_sorted[:, 2] / (scales_sorted[:, 1] + 1e-7)
+            needle_pts_mask = torch.logical_and(
+                padded_grad >= grad_threshold * 0.5,
+                torch.logical_and(
+                    needle_ratio > split_needle_ratio,
+                    scales_sorted[:, 2] > self.percent_dense * scene_extent
+                )
+            )
+            selected_pts_mask = torch.logical_or(selected_pts_mask, needle_pts_mask)
+
+        if not selected_pts_mask.any():
+            return
+
+        selected_scales = self.get_scaling[selected_pts_mask]
+        stds = selected_scales.repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+
+        scale_div = torch.full_like(selected_scales, 0.8 * N)
+        sel_needle = needle_pts_mask[selected_pts_mask]
+        if split_needle_ratio > 0.0 and sel_needle.any():
+            # Halve only the longest axis for needle Gaussians so their aspect ratio drops immediately
+            needle_div = torch.ones_like(selected_scales)
+            max_axis = torch.argmax(selected_scales, dim=1, keepdim=True)
+            needle_div.scatter_(1, max_axis, float(N))
+            scale_div = torch.where(sel_needle.unsqueeze(1), needle_div, scale_div)
+
+        new_scaling = self.scaling_inverse_activation(selected_scales.repeat(N, 1) / scale_div.repeat(N, 1))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -396,18 +430,30 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size,
+                          split_needle_ratio=0.0, prune_needle_ratio=0.0, max_ws_scale_ratio=0.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent, split_needle_ratio=split_needle_ratio)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            ws_ratio = max_ws_scale_ratio if max_ws_scale_ratio > 0.0 else 0.1
+            big_points_ws = self.get_scaling.max(dim=1).values > ws_ratio * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        elif max_ws_scale_ratio > 0.0:
+            big_points_ws = self.get_scaling.max(dim=1).values > max_ws_scale_ratio * extent
+            prune_mask = torch.logical_or(prune_mask, big_points_ws)
+
+        if prune_needle_ratio > 0.0:
+            scales_sorted, _ = torch.sort(self.get_scaling, dim=1)
+            needle_ratio = scales_sorted[:, 2] / (scales_sorted[:, 1] + 1e-7)
+            spiky_points = needle_ratio > prune_needle_ratio
+            prune_mask = torch.logical_or(prune_mask, spiky_points)
+
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()

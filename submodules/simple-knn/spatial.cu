@@ -24,3 +24,18 @@ distCUDA2(const torch::Tensor& points)
 
   return means;
 }
+
+torch::Tensor
+meanDistCUDA6(const torch::Tensor& points)
+{
+  const int P = points.size(0);
+
+  auto float_opts = points.options().dtype(torch::kFloat32);
+  torch::Tensor means = torch::full({P}, 0.0, float_opts);
+
+  if (P > 1) {
+    SimpleKNN::knnL2_6(P, (float3*)points.contiguous().data<float>(), means.contiguous().data<float>());
+  }
+
+  return means;
+}

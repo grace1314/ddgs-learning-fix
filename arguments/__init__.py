@@ -94,6 +94,12 @@ class OptimizationParams(ParamGroup):
         self.drop_min = 0.05
         self.drop_max = 0.3
         self.lambda_far = 1.0
+        self.lambda_anisotropy = 0.0
+        self.max_needle_ratio = 8.0
+        self.split_needle_ratio = 0.0
+        self.prune_needle_ratio = 0.0
+        self.size_threshold = 0
+        self.max_ws_scale_ratio = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

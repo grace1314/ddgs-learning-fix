@@ -19,6 +19,35 @@
   <img src="figures/pipeline.png" alt="Pipeline Image">
 </p>
 
+## Learning Notes, Bug Fixes & Enhancements (`ddgs-learning-fix`)
+
+This repository extends the official **D²GS (ICLR 2026)** implementation with comprehensive code-reading notes, needle-artifact pruning, and a custom CUDA K-NN kernel optimization:
+
+- **Study & Practice Notes (Copilot Q&A Summary)**: [docs/COPILOT_STUDY_AND_FIX_NOTES.md](./docs/COPILOT_STUDY_AND_FIX_NOTES.md)
+- **Future Learning & Improvement Roadmap**: [docs/LEARNING_AND_IMPROVEMENT_ROADMAP.md](./docs/LEARNING_AND_IMPROVEMENT_ROADMAP.md)
+
+### Key Code Improvements Included
+1. **Needle / Spiky Gaussian Elimination Pipeline (Methods 1 + 2 + 3)**:
+   - **Method 1 (`train.py`)**: Log-space detached needle anisotropy regularization (`--lambda_anisotropy`, `--max_needle_ratio`) that shrinks needle spikes (`s_max / s_mid`) without blowing up flat surface disks.
+   - **Method 2 (`scene/gaussian_model.py`)**: Directional principal-axis splitting (`--split_needle_ratio`) that halves only the longest axis, plus world-scale/needle pruning (`--prune_needle_ratio`, `--max_ws_scale_ratio`) and a `load_ply` `max_radii2D` initialization fix.
+   - **Method 3 (`tools/clean_gaussians.py`)**: Standalone post-training geometric cleaner + short topology-frozen healing finetuner (`PSNR 35.08 dB -> 36.36 dB` with **0** needles > `8.0` on custom full-res capture).
+2. **Pure-GPU Morton-BVH 6-NN Density Kernel (`submodules/simple-knn`)**:
+   - Added `meanDistCUDA6` (`boxMeanL2DistK<6>`) in CUDA to replace the CPU `sklearn.neighbors.NearestNeighbors` bottleneck in `GaussianModel.update_density_score()`, achieving **11.3× – 27.7× speedup** with exact numerical equivalence.
+
+### Quick Usage for Enhanced Needle-Free Training
+```bash
+# Step 1: Train with needle anisotropy loss + directional needle split/prune
+python train.py -s dataset/your_scene -m output_your_scene \
+    --depth_weight 0.15 --density_weight 0.85 --drop_min 0.05 --drop_max 0.4 \
+    --lambda_anisotropy 0.05 --max_needle_ratio 8.0 \
+    --split_needle_ratio 12.0 --prune_needle_ratio 16.0 --max_ws_scale_ratio 0.5 \
+    --densify_until_iter 8500 -r 1 --n_views 11
+
+# Step 2: Post-clean geometric filter + 1000-iter healing finetune
+python tools/clean_gaussians.py -m output_your_scene \
+    --iteration 10000 --clean_needle_ratio 8.0 --clean_ws_scale_ratio 0.5 \
+    --clean_min_opacity 0.02 --finetune_iters 1000
+```
 
 ## Overview 
 

@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# Datasets, outputs, checkpoints, and precomputed caches
+dataset/
+output*/
+preprocessed_masks*/
+sr_models/
+*.pth
+*.pt
+*.dump
+mw2_stability_results_*.csv
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
